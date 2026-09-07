@@ -6,10 +6,10 @@ of the judgment applied around it.
 **Tooling:** Claude Code (Opus 5), one session, working directly in the repository — reading and
 writing files, running Maven and Docker, executing the test suite and the Postman collection.
 
-**On the raw transcript.** The verbatim JSONL log is deliberately not committed. It contains the
-full text of Caseware's take-home brief, which is not mine to publish, along with local absolute
-paths and personal identifiers. This document is a curated account instead. The raw log is
-retained locally and can be shared privately on request.
+**On the raw transcript.** The verbatim JSONL log is included at
+[`ai-session/claude-code-transcript.jsonl`](ai-session/claude-code-transcript.jsonl) — 1,272
+records covering every prompt, response, tool call and command output. This document is the
+readable account; that file is the unedited evidence behind it.
 
 ---
 

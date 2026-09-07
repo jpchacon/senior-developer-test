@@ -1,0 +1,1012 @@
+{
+  "info": {
+    "_postman_id": "8c1f0a6e-4d2b-4a17-9f3c-templateupdate01",
+    "name": "Template Update Advisor API",
+    "description": "Workflow and validations for the Template Update Advisor (Caseware take-home, Part 2).\n\n## Before you run\n\n1. `docker compose up -d` \u2014 starts PostgreSQL on :5433\n2. `mvn spring-boot:run` \u2014 Flyway migrates on startup\n3. Seed the projection (it is normally fed by events from the engagement management system, which is outside this slice):\n\n```sql\nINSERT INTO engagement_template_state\n  (engagement_id, template_id, current_version, declined_versions)\nVALUES ('eng-1','audit-ca',3,'{4}'),\n       ('eng-2','audit-ca',5,'{}'),\n       ('eng-3','audit-ca',6,'{}')\nON CONFLICT (engagement_id) DO NOTHING;\n```\n\nRun it with:\n```\ndocker exec -i advisor-postgres psql -U advisor -d advisor\n```\n\n## The scenario these tests encode\n\n| Engagement | On version | Declined | With v6 published |\n|---|---|---|---|\n| `eng-1` | v3 | v4 | pending, **v3 \u2192 v6** |\n| `eng-2` | v5 | \u2014 | pending, v5 \u2192 v6 |\n| `eng-3` | v6 | \u2014 | omitted, already current |\n\n`eng-1` is the case worth watching. It declined v4, but its pending range still starts at **v3** \u2014 declining defers a version, it does not skip its content. That rule is asserted directly in the *Domain invariants* folder.\n\n## Running order\n\nFolders are ordered as a workflow and are meant to run top to bottom (Postman Runner, or `newman run postman/template-update-advisor.postman_collection.json`). *Preconditions* fails fast with an actionable message if the app is down or the projection is unseeded.\n\n## Known limitation\n\n`firmId` in the path is accepted but not yet used to select a tenant \u2014 the slice runs against a single schema, and multi-tenancy is by schema-per-firm in the design. Any `firmId` returns the same rows.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "0. Preconditions",
+      "description": "Run first. Fails loudly and specifically when the environment is not ready.",
+      "item": [
+        {
+          "name": "Health \u2014 app is up and the database is reachable",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "let body;",
+                  "try { body = pm.response.json(); } catch (e) { body = null; }",
+                  "",
+                  "pm.test('Port {{baseUrl}} is actually the Template Update Advisor', () => {",
+                  "    pm.expect(body, 'no JSON body - something else is serving this port').to.not.be.null;",
+                  "    pm.expect(body, 'expected an Actuator health payload. Another process may hold this port: '",
+                  "        + 'check with `lsof -nP -iTCP:8080 -sTCP:LISTEN`').to.have.property('status');",
+                  "});",
+                  "",
+                  "pm.test('Application reports UP', () => pm.expect(body.status).to.eql('UP'));",
+                  "",
+                  "pm.test('PostgreSQL is connected (Flyway will have migrated on startup)', () => {",
+                  "    pm.expect(body.components.db.status).to.eql('UP');",
+                  "    pm.expect(body.components.db.details.database).to.eql('PostgreSQL');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ],
+              "query": []
+            },
+            "description": "Run this first. It also guards against a very specific trap: if another process holds port 8080, the rest of the collection fails in confusing ways. This test names that explicitly."
+          },
+          "response": []
+        },
+        {
+          "name": "Precondition \u2014 projection has been seeded",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const rows = pm.response.json();",
+                  "",
+                  "pm.test('Projection contains seeded engagements', () => {",
+                  "    pm.expect(rows, 'projection is empty - run the seed SQL in the collection description')",
+                  "        .to.be.an('array').that.is.not.empty;",
+                  "});",
+                  "",
+                  "// Later requests assert against these, so record what the service actually returned.",
+                  "pm.collectionVariables.set('seededRowCount', rows.length);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=6",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "6"
+                }
+              ]
+            },
+            "description": "The pending-updates list is driven by the engagement projection, which is normally fed by events from the engagement management system (out of scope for this slice). If this fails, run the seed SQL from the collection description."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "1. Core workflow",
+      "description": "The happy path, from an accumulated backlog down to nothing pending.",
+      "item": [
+        {
+          "name": "Accumulated updates \u2014 engagement 3 versions behind (latest=6)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Content-Type is JSON', () =>",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/json'));",
+                  "pm.test('Responds well under a second', () => pm.expect(pm.response.responseTime).to.be.below(1000));",
+                  "",
+                  "const rows = pm.response.json();",
+                  "pm.test('Body is an array', () => pm.expect(rows).to.be.an('array'));",
+                  "",
+                  "pm.test('Every row has the full contract, correctly typed', () => {",
+                  "    rows.forEach(r => {",
+                  "        pm.expect(r.engagementId, 'engagementId').to.be.a('string').and.not.empty;",
+                  "        pm.expect(r.templateId, 'templateId').to.be.a('string').and.not.empty;",
+                  "        pm.expect(r.currentVersion, 'currentVersion').to.be.a('number');",
+                  "        pm.expect(r.latestVersion, 'latestVersion').to.be.a('number');",
+                  "        pm.expect(r.versionsBehind, 'versionsBehind').to.be.a('number');",
+                  "        pm.expect(r.previouslyDeclined, 'previouslyDeclined').to.be.an('array');",
+                  "        pm.expect(r.summaryHeadline, 'summaryHeadline').to.be.a('string').and.not.empty;",
+                  "        pm.expect(r.summaryPoints, 'summaryPoints').to.be.an('array');",
+                  "    });",
+                  "});",
+                  "",
+                  "pm.test('eng-1 spans the net range v3 to v6, not one step at a time', () => {",
+                  "    const eng1 = rows.find(r => r.engagementId === 'eng-1');",
+                  "    pm.expect(eng1, 'eng-1 missing - reseed the projection').to.exist;",
+                  "    pm.expect(eng1.currentVersion).to.eql(3);",
+                  "    pm.expect(eng1.latestVersion).to.eql(6);",
+                  "    pm.expect(eng1.versionsBehind).to.eql(3);",
+                  "});",
+                  "",
+                  "pm.test('A summary is present and mentions the range it covers', () => {",
+                  "    const eng1 = rows.find(r => r.engagementId === 'eng-1');",
+                  "    pm.expect(eng1.summaryPoints).to.not.be.empty;",
+                  "    pm.expect(eng1.summaryHeadline).to.include('v3');",
+                  "    pm.expect(eng1.summaryHeadline).to.include('v6');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=6",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "6"
+                }
+              ]
+            },
+            "description": "The central case. eng-1 sits on v3 with v4, v5 and v6 published. The range must be the net v3 to v6, never three composed steps."
+          },
+          "response": []
+        },
+        {
+          "name": "Single-step update (latest=4)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const rows = pm.response.json();",
+                  "",
+                  "pm.test('Only the engagement behind v4 is listed', () => {",
+                  "    pm.expect(rows.map(r => r.engagementId)).to.eql(['eng-1']);",
+                  "});",
+                  "",
+                  "pm.test('Range is v3 to v4, one version behind', () => {",
+                  "    pm.expect(rows[0].currentVersion).to.eql(3);",
+                  "    pm.expect(rows[0].latestVersion).to.eql(4);",
+                  "    pm.expect(rows[0].versionsBehind).to.eql(1);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=4",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "4"
+                }
+              ]
+            },
+            "description": "One version published since the engagement was created."
+          },
+          "response": []
+        },
+        {
+          "name": "Nothing pending \u2014 every engagement is current (latest=3)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns an empty array, not null and not an error', () => {",
+                  "    const rows = pm.response.json();",
+                  "    pm.expect(rows).to.be.an('array').that.is.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=3",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "3"
+                }
+              ]
+            },
+            "description": "Engagements at or beyond the published version must be absent, not returned with an empty update."
+          },
+          "response": []
+        },
+        {
+          "name": "Unknown template returns empty, not an error",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns an empty array', () =>",
+                  "    pm.expect(pm.response.json()).to.be.an('array').that.is.empty);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId=no-such-template&latestVersion=9",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "no-such-template"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "9"
+                }
+              ]
+            },
+            "description": "A template no engagement was built from is a legitimate query with no results."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. Domain invariants",
+      "description": "Properties that must hold regardless of the seed data \u2014 including the decline rule.",
+      "item": [
+        {
+          "name": "Invariants \u2014 properties that must hold for every row",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const rows = pm.response.json();",
+                  "",
+                  "pm.test('An update never runs backwards', () => {",
+                  "    rows.forEach(r => pm.expect(r.latestVersion, r.engagementId).to.be.above(r.currentVersion));",
+                  "});",
+                  "",
+                  "pm.test('versionsBehind is consistent with the range it describes', () => {",
+                  "    rows.forEach(r =>",
+                  "        pm.expect(r.versionsBehind, r.engagementId).to.eql(r.latestVersion - r.currentVersion));",
+                  "});",
+                  "",
+                  "// The rule most likely to be got wrong. Declining v4 defers it; it must never advance the",
+                  "// version the next diff is computed from. If a decline had wrongly moved the pointer, a",
+                  "// declined version would appear at or below currentVersion.",
+                  "pm.test('DECLINE RULE: a declined version never becomes the current version', () => {",
+                  "    rows.forEach(r => {",
+                  "        r.previouslyDeclined.forEach(declined => {",
+                  "            pm.expect(declined, `${r.engagementId} declined v${declined} but sits on v${r.currentVersion}`)",
+                  "                .to.be.above(r.currentVersion);",
+                  "            pm.expect(declined, `${r.engagementId} declined v${declined} beyond the pending range`)",
+                  "                .to.be.at.most(r.latestVersion);",
+                  "        });",
+                  "    });",
+                  "});",
+                  "",
+                  "pm.test('eng-1 declined v4 yet its range still starts at v3', () => {",
+                  "    const eng1 = rows.find(r => r.engagementId === 'eng-1');",
+                  "    pm.expect(eng1.previouslyDeclined).to.include(4);",
+                  "    pm.expect(eng1.currentVersion, 'a decline is a deferral, not a skip').to.eql(3);",
+                  "});",
+                  "",
+                  "pm.test('An engagement already on the latest version is omitted entirely', () => {",
+                  "    pm.expect(rows.map(r => r.engagementId)).to.not.include('eng-3');",
+                  "});",
+                  "",
+                  "pm.test('Anything pending carries something to read', () => {",
+                  "    rows.forEach(r => {",
+                  "        pm.expect(r.summaryPoints, r.engagementId).to.not.be.empty;",
+                  "        pm.expect(r.summaryHeadline, r.engagementId).to.not.be.empty;",
+                  "    });",
+                  "});",
+                  "",
+                  "pm.test('Rows are scoped to the template that was asked for', () => {",
+                  "    rows.forEach(r => pm.expect(r.templateId).to.eql(pm.collectionVariables.get('templateId')));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=6",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "6"
+                }
+              ]
+            },
+            "description": "These assert relationships rather than fixed values, so they keep their meaning if the seed data changes. This is where the design's core rules are enforced from the outside."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Input validation",
+      "description": "Every rejected input must be a 4xx. A 500 here would mean the service blames itself for the caller's mistake, and would corrupt error-rate alerting.",
+      "item": [
+        {
+          "name": "Rejects version 0",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Uses the problem+json content type', () =>",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/problem+json'));",
+                  "pm.test('Is a client error, not a server fault', () => {",
+                  "    pm.expect(pm.response.code, 'a rejected parameter must never surface as 5xx')",
+                  "        .to.be.within(400, 499);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test('Explains what was wrong in the domain\\'s own words', () => {",
+                  "    pm.expect(body.title).to.eql('Invalid request parameter');",
+                  "    pm.expect(body.detail).to.include('must be positive');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "0"
+                }
+              ]
+            },
+            "description": "Template versions are 1-based; 0 is not a valid version."
+          },
+          "response": []
+        },
+        {
+          "name": "Rejects a negative version",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Uses the problem+json content type', () =>",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/problem+json'));",
+                  "pm.test('Is a client error, not a server fault', () => {",
+                  "    pm.expect(pm.response.code, 'a rejected parameter must never surface as 5xx')",
+                  "        .to.be.within(400, 499);",
+                  "});",
+                  "pm.test('Names the offending value', () =>",
+                  "    pm.expect(pm.response.json().detail).to.include('-1'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=-1",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "-1"
+                }
+              ]
+            },
+            "description": "Same rule, stated from the other side of zero."
+          },
+          "response": []
+        },
+        {
+          "name": "Rejects a blank template id",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Uses the problem+json content type', () =>",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/problem+json'));",
+                  "pm.test('Is a client error, not a server fault', () => {",
+                  "    pm.expect(pm.response.code, 'a rejected parameter must never surface as 5xx')",
+                  "        .to.be.within(400, 499);",
+                  "});",
+                  "pm.test('Says which parameter was wrong', () =>",
+                  "    pm.expect(pm.response.json().detail).to.include('templateId'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId=&latestVersion=6",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": ""
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "6"
+                }
+              ]
+            },
+            "description": "A blank identifier is rejected by the value type itself."
+          },
+          "response": []
+        },
+        {
+          "name": "Rejects a non-numeric version",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Uses the problem+json content type', () =>",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('application/problem+json'));",
+                  "pm.test('Is a client error, not a server fault', () => {",
+                  "    pm.expect(pm.response.code, 'a rejected parameter must never surface as 5xx')",
+                  "        .to.be.within(400, 499);",
+                  "});",
+                  "pm.test('Reports the value it could not read', () =>",
+                  "    pm.expect(pm.response.json().detail).to.include('abc'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?templateId={{templateId}}&latestVersion=abc",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "templateId",
+                  "value": "{{templateId}}"
+                },
+                {
+                  "key": "latestVersion",
+                  "value": "abc"
+                }
+              ]
+            },
+            "description": "Type coercion failure, handled the same way."
+          },
+          "response": []
+        },
+        {
+          "name": "Rejects a missing required parameter",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Is a client error', () => pm.expect(pm.response.code).to.be.within(400, 499));",
+                  "pm.test('Identifies the failing request', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.status).to.eql(400);",
+                  "    pm.expect(body.path).to.include('pending-updates');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/firms/{{firmId}}/engagements/pending-updates?latestVersion=6",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "firms",
+                "{{firmId}}",
+                "engagements",
+                "pending-updates"
+              ],
+              "query": [
+                {
+                  "key": "latestVersion",
+                  "value": "6"
+                }
+              ]
+            },
+            "description": "Handled by Spring before the controller runs, so the body is the framework's default error shape rather than problem+json. The status is what matters."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Observability",
+      "description": "The signals DESIGN.md section 4 commits to.",
+      "item": [
+        {
+          "name": "Health detail",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Database component is UP', () =>",
+                  "    pm.expect(pm.response.json().components.db.status).to.eql('UP'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ],
+              "query": []
+            },
+            "description": "Full health payload including the database check."
+          },
+          "response": []
+        },
+        {
+          "name": "Metric \u2014 projection.drift.detected",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Exposes a COUNT measurement', () => {",
+                  "    pm.expect(body.name).to.eql(pm.request.url.path[2]);",
+                  "    pm.expect(body.measurements[0].statistic).to.eql('COUNT');",
+                  "    pm.expect(body.measurements[0].value).to.be.a('number');",
+                  "});",
+                  "pm.test('Carries a description an operator can act on', () =>",
+                  "    pm.expect(body.description).to.be.a('string').and.not.empty);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/projection.drift.detected",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "projection.drift.detected"
+              ],
+              "query": []
+            },
+            "description": "The load-bearing SLI: engagements whose real version differed from the projection. A rising value undermines the premise of the whole design."
+          },
+          "response": []
+        },
+        {
+          "name": "Metric \u2014 summary.cache.hit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Exposes a COUNT measurement', () => {",
+                  "    pm.expect(body.name).to.eql(pm.request.url.path[2]);",
+                  "    pm.expect(body.measurements[0].statistic).to.eql('COUNT');",
+                  "    pm.expect(body.measurements[0].value).to.be.a('number');",
+                  "});",
+                  "pm.test('Carries a description an operator can act on', () =>",
+                  "    pm.expect(body.description).to.be.a('string').and.not.empty);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/summary.cache.hit",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "summary.cache.hit"
+              ],
+              "query": []
+            },
+            "description": "Summaries reused across firms rather than recomputed."
+          },
+          "response": []
+        },
+        {
+          "name": "Metric \u2014 narration.validation.failed",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Exposes a COUNT measurement', () => {",
+                  "    pm.expect(body.name).to.eql(pm.request.url.path[2]);",
+                  "    pm.expect(body.measurements[0].statistic).to.eql('COUNT');",
+                  "    pm.expect(body.measurements[0].value).to.be.a('number');",
+                  "});",
+                  "pm.test('Carries a description an operator can act on', () =>",
+                  "    pm.expect(body.description).to.be.a('string').and.not.empty);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/narration.validation.failed",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "narration.validation.failed"
+              ],
+              "query": []
+            },
+            "description": "How often generated prose was caught not matching the diff."
+          },
+          "response": []
+        },
+        {
+          "name": "Metric \u2014 narration.fallback.used",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Exposes a COUNT measurement', () => {",
+                  "    pm.expect(body.name).to.eql(pm.request.url.path[2]);",
+                  "    pm.expect(body.measurements[0].statistic).to.eql('COUNT');",
+                  "    pm.expect(body.measurements[0].value).to.be.a('number');",
+                  "});",
+                  "pm.test('Carries a description an operator can act on', () =>",
+                  "    pm.expect(body.description).to.be.a('string').and.not.empty);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/metrics/narration.fallback.used",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "metrics",
+                "narration.fallback.used"
+              ],
+              "query": []
+            },
+            "description": "Requests served by the deterministic renderer."
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Shared helpers, available to every request in this collection.",
+          "pm.collectionVariables.set('_helpersLoaded', 'true');"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "description": "Change if another process holds 8080; the health check will tell you."
+    },
+    {
+      "key": "firmId",
+      "value": "firm-7",
+      "description": "Accepted but not yet used to select a tenant - see Known limitation."
+    },
+    {
+      "key": "templateId",
+      "value": "audit-ca"
+    },
+    {
+      "key": "seededRowCount",
+      "value": ""
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: template-update-advisor
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5433/advisor}
+    username: ${DATABASE_USER:advisor}
+    password: ${DATABASE_PASSWORD:advisor}
+  flyway:
+    enabled: true
+    # The tenant schema is created per firm; both are migrated together for the local single-firm
+    # setup that this slice runs as.
+    schemas: public
+    default-schema: public
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always

@@ -1,0 +1,26 @@
+# Local PostgreSQL for running the application by hand.
+#
+# The integration tests do NOT use this: Testcontainers starts and stops its own container on a
+# random port. The two are deliberately independent, so a running compose stack cannot interfere
+# with a test run and vice versa.
+services:
+  postgres:
+    image: postgres:16
+    container_name: advisor-postgres
+    environment:
+      POSTGRES_DB: advisor
+      POSTGRES_USER: advisor
+      POSTGRES_PASSWORD: advisor
+    ports:
+      # 5433 on the host, to stay clear of any PostgreSQL already running on 5432.
+      - "5433:5432"
+    volumes:
+      - advisor-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U advisor -d advisor"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  advisor-pgdata:

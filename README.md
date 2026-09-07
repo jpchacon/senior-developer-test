@@ -1,7 +1,9 @@
 # Template Update Advisor
 
 Part 2 of the take-home: one implemented slice of the system designed in **[DESIGN.md](DESIGN.md)**.
-C4 diagrams are in **[DIAGRAMS.md](DIAGRAMS.md)**.
+C4 diagrams are in **[DIAGRAMS.md](DIAGRAMS.md)**, and
+**[AI-SESSION-HISTORY.md](AI-SESSION-HISTORY.md)** records how this was built with AI assistance —
+including where the model was wrong and what caught it.
 
 ## What this slice is
 
